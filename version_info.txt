@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 1, 0),
-    prodvers=(1, 0, 1, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         u'040904B0',
         [
           StringStruct(u'CompanyName', u'QMK.Top'),
-          StringStruct(u'FileDescription', u'QMK.Top Manager'),
-          StringStruct(u'FileVersion', u'1.0.1.0'),
-          StringStruct(u'InternalName', u'QMK.Top Manager'),
-          StringStruct(u'OriginalFilename', u'QMK.Top Manager.exe'),
-          StringStruct(u'ProductName', u'QMK.Top Manager'),
-          StringStruct(u'ProductVersion', u'1.0.1.0'),
+          StringStruct(u'FileDescription', u'QMK.Top Manager for SK75 TMR'),
+          StringStruct(u'FileVersion', u'1.1.0.0'),
+          StringStruct(u'InternalName', u'QMK.Top Manager for SK75 TMR'),
+          StringStruct(u'OriginalFilename', u'QMK.Top Manager for SK75 TMR.exe'),
+          StringStruct(u'ProductName', u'QMK.Top Manager for SK75 TMR'),
+          StringStruct(u'ProductVersion', u'1.1.0.0'),
         ]
       )
     ]),

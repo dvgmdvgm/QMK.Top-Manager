@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import http.client
+import re
 import shutil
 import socket
 import subprocess
@@ -15,8 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
+from urllib.parse import urlsplit
 from typing import Callable, Optional
 
 import websocket  # websocket-client
@@ -32,17 +33,124 @@ def _resource_path(rel: str) -> str:
 SNIFFER_JS_PATH = _resource_path("sniffer.js")
 DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "sniffer_debug.log")
 PY_BINDING = "qmkPyEmit"
+DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
+DEBUG_LOG_BACKUP_COUNT = 2
+_DEBUG_LOG_LOCK = threading.RLock()
+CDP_VERSION_RESPONSE_MAX_BYTES = 64 * 1024
+_CDP_BROWSER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,256}")
+
+
+def _cdp_allowed_origin(port: int) -> str:
+    """Return the sole loopback WebSocket origin used by this sniffer."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("некорректный локальный CDP-порт") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("некорректный локальный CDP-порт")
+    return f"http://127.0.0.1:{port}"
+
+
+def _validate_browser_ws_endpoint(endpoint: object, expected_port: int) -> str:
+    """Accept only the browser CDP endpoint owned by our loopback listener.
+
+    ``/json/version`` is read from a local TCP endpoint, but it is still
+    external input.  Reject a redirect-like URL, a page target, a different
+    port, credentials, query strings and every non-loopback host before it is
+    handed to the WebSocket client.
+    """
+    _cdp_allowed_origin(expected_port)  # validates the expected port too
+    if not isinstance(endpoint, str) or len(endpoint) > 1024:
+        raise ValueError("Chrome DevTools вернул некорректный WebSocket URL")
+    try:
+        parsed = urlsplit(endpoint)
+        actual_port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Chrome DevTools вернул некорректный WebSocket URL") from exc
+
+    if (
+        parsed.scheme.lower() != "ws"
+        # Chromium commonly advertises ``localhost`` even when its DevTools
+        # listener was explicitly bound to 127.0.0.1.  Accept that spelling,
+        # then canonicalise it below so the WebSocket client never performs a
+        # hosts-file/DNS lookup for it.
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or actual_port != int(expected_port)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Chrome DevTools вернул endpoint вне локального браузера")
+
+    parts = parsed.path.split("/")
+    if (
+        len(parts) != 4
+        or parts[:3] != ["", "devtools", "browser"]
+        or not _CDP_BROWSER_ID_RE.fullmatch(parts[3])
+    ):
+        raise ValueError("Chrome DevTools вернул некорректный browser endpoint")
+    # Return a canonical string, not a quirky-but-parseable source URL.
+    return f"ws://127.0.0.1:{int(expected_port)}{parsed.path}"
+
+
+def _read_browser_ws_endpoint(port: int) -> str:
+    """Fetch a size-limited CDP version document without redirects/proxies."""
+    _cdp_allowed_origin(port)
+    connection = http.client.HTTPConnection("127.0.0.1", int(port), timeout=1)
+    try:
+        connection.request("GET", "/json/version", headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError("Chrome DevTools не принял локальный запрос")
+        raw = response.read(CDP_VERSION_RESPONSE_MAX_BYTES + 1)
+    finally:
+        connection.close()
+
+    if len(raw) > CDP_VERSION_RESPONSE_MAX_BYTES:
+        raise ValueError("Chrome DevTools вернул слишком большой ответ")
+    try:
+        info = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Chrome DevTools вернул некорректный JSON") from exc
+    if not isinstance(info, dict):
+        raise ValueError("Chrome DevTools вернул некорректный JSON")
+    return _validate_browser_ws_endpoint(info.get("webSocketDebuggerUrl"), port)
+
+
+def _rotate_debug_log_if_needed() -> None:
+    """Keep opt-in protocol diagnostics bounded without fsyncing every event."""
+    try:
+        if not os.path.isfile(DEBUG_LOG_PATH):
+            return
+        if os.path.getsize(DEBUG_LOG_PATH) < DEBUG_LOG_MAX_BYTES:
+            return
+        oldest = f"{DEBUG_LOG_PATH}.{DEBUG_LOG_BACKUP_COUNT}"
+        try:
+            os.remove(oldest)
+        except FileNotFoundError:
+            pass
+        for index in range(DEBUG_LOG_BACKUP_COUNT - 1, 0, -1):
+            source = f"{DEBUG_LOG_PATH}.{index}"
+            target = f"{DEBUG_LOG_PATH}.{index + 1}"
+            if os.path.isfile(source):
+                os.replace(source, target)
+        os.replace(DEBUG_LOG_PATH, f"{DEBUG_LOG_PATH}.1")
+    except OSError:
+        # Debug tracing must never stop a requested HID/session shutdown.
+        pass
 
 
 def _dlog(msg: str) -> None:
     try:
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
+        # CDP payloads are external input.  Keep one diagnostic line bounded
+        # and escaped, then rotate before appending; a busy page cannot turn
+        # this optional log into an unbounded disk/CPU sink.
+        safe = str(msg).replace("\r", "\\r").replace("\n", "\\n")[:2048]
+        with _DEBUG_LOG_LOCK:
+            _rotate_debug_log_if_needed()
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {safe}\n")
     except Exception:
         pass
 
@@ -183,13 +291,18 @@ class HIDSniffer:
         if not chrome:
             raise RuntimeError("Chromium-браузер не найден. Укажи путь к chrome.exe / msedge.exe вручную.")
         self.port = _free_port()
+        self.cdp_origin = _cdp_allowed_origin(self.port)
         self.profile_dir = tempfile.mkdtemp(prefix="qmk_sniff_")
         _dlog(f"port={self.port} profile={self.profile_dir}")
         self.on_status(f"Запускаю браузер (порт {self.port})…")
         self.proc = subprocess.Popen([
             chrome,
             f"--remote-debugging-port={self.port}",
-            f"--remote-allow-origins=*",
+            # CDP owns the whole temporary browser profile.  Bind it to
+            # loopback and allow only this process's matching loopback Origin,
+            # never Chromium's broad ``*`` development escape hatch.
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-allow-origins={self.cdp_origin}",
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -197,14 +310,25 @@ class HIDSniffer:
             self.url,
         ])
         _dlog(f"chrome pid={self.proc.pid}")
-        browser_ws = self._wait_for_browser_ws(timeout=15)
-        _dlog(f"browser_ws={browser_ws}")
         try:
-            self.ws = websocket.create_connection(browser_ws, timeout=30, max_size=None)
+            browser_ws = self._wait_for_browser_ws(timeout=15)
+            _dlog(f"browser_ws={browser_ws}")
+            self.ws = websocket.create_connection(
+                browser_ws,
+                timeout=30,
+                # A CDP command/event for this sniffer is small.  An unbounded
+                # frame was a needless local memory-exhaustion surface.
+                max_size=8 * 1024 * 1024,
+                origin=self.cdp_origin,
+            )
             self.ws.settimeout(None)
             _dlog("ws connected OK")
         except Exception as ex:
             _dlog(f"WS CONNECT FAIL: {type(ex).__name__}: {ex}")
+            # A failed CDP startup must not leave a temporary profile or an
+            # invisible Chromium process behind.  ``stop`` is safe before the
+            # listener is marked alive and makes the retry path clean.
+            self.stop()
             raise RuntimeError(f"Не удалось открыть CDP WebSocket: {ex}")
         self._alive = True
         self._sessions = {}
@@ -254,12 +378,10 @@ class HIDSniffer:
         deadline = time.time() + timeout
         last_err = None
         while time.time() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise RuntimeError("Chromium завершил работу до запуска DevTools")
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=1) as r:
-                    info = json.load(r)
-                ws = info.get("webSocketDebuggerUrl")
-                if ws:
-                    return ws
+                return _read_browser_ws_endpoint(self.port)
             except Exception as e:
                 last_err = e
             time.sleep(0.3)

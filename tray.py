@@ -14,6 +14,7 @@ _GREY_COLOR = (140, 140, 140, 255)
 _GREEN = (60, 179, 113, 255)    # >=50
 _YELLOW = (229, 165, 10, 255)   # 20..49
 _RED = (208, 68, 55, 255)       # <20
+_USB = (83, 177, 255, 255)
 
 _BASE_ICON_PATH: Optional[str] = None
 _BASE_ICON_CACHE: Optional[Image.Image] = None
@@ -49,11 +50,43 @@ def _fill_color(percent: int) -> tuple:
     return _RED
 
 
-def render_battery_image(state: BatteryState) -> Image.Image:
-    return _render_battery_badge(state, badge_size=64)
+def render_battery_image(
+    state: BatteryState, *, transport: Optional[str] = None
+) -> Image.Image:
+    return _render_battery_badge(state, badge_size=64, transport=transport)
 
 
-def _render_battery_badge(state: BatteryState, badge_size: int = _ICON_SIZE) -> Image.Image:
+def _render_usb_badge(badge_size: int) -> Image.Image:
+    """Draw a compact blue USB trident for a confirmed wired connection."""
+    img = Image.new("RGBA", (badge_size, badge_size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    scale = badge_size / 32
+
+    def p(x, y):
+        return int(x * scale), int(y * scale)
+
+    width = max(1, int(2 * scale))
+    # Stem and plug.
+    draw.line([p(16, 28), p(16, 12)], fill=_USB, width=width)
+    draw.rectangle((*p(12, 23), *p(20, 29)), outline=_USB, width=width)
+    # Up arrow, circle and square branches: conventional USB trident shape.
+    draw.line([p(16, 12), p(16, 5)], fill=_USB, width=width)
+    draw.polygon([p(16, 3), p(13, 7), p(19, 7)], fill=_USB)
+    draw.line([p(16, 16), p(8, 11)], fill=_USB, width=width)
+    draw.ellipse((*p(5, 8), *p(9, 12)), outline=_USB, width=width)
+    draw.line([p(16, 19), p(24, 14)], fill=_USB, width=width)
+    draw.rectangle((*p(23, 11), *p(27, 15)), outline=_USB, width=width)
+    return img
+
+
+def _render_battery_badge(
+    state: BatteryState,
+    badge_size: int = _ICON_SIZE,
+    *,
+    transport: Optional[str] = None,
+) -> Image.Image:
+    if transport == "wired" and (state.is_stale or state.percent is None):
+        return _render_usb_badge(badge_size)
     img = Image.new("RGBA", (badge_size, badge_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -113,32 +146,33 @@ class TrayIcon:
         self._on_hide = on_hide
         self._on_quit = on_quit
         self._window_visible = True
+        self._transport: Optional[str] = None
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
 
     def _build_menu(self) -> pystray.Menu:
+        # On Windows pystray invokes the menu's default item on a normal
+        # left-click.  Keep that action deliberately invisible in the
+        # right-click menu: a single click must immediately restore the app,
+        # not open a second "show/hide" choice menu.
         return pystray.Menu(
             pystray.MenuItem(
-                "Показать", lambda icon, item: self._on_show(),
-                enabled=lambda item: not self._window_visible,
+                "Открыть приложение",
+                lambda icon, item: self._on_show(),
+                default=True,
+                visible=False,
             ),
-            pystray.MenuItem(
-                "Скрыть", lambda icon, item: self._on_hide(),
-                enabled=lambda item: self._window_visible,
-            ),
-            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", lambda icon, item: self._on_quit()),
         )
 
     def start(self) -> None:
-        initial = render_battery_image(BatteryState())
+        initial = render_battery_image(BatteryState(), transport=self._transport)
         self._icon = pystray.Icon(
             name="qmk_manager",
             icon=initial,
             title="QMK.Top Manager — Battery: no data",
             menu=self._build_menu(),
         )
-        self._icon.on_activate = lambda icon: self._on_toggle()
         self._thread = threading.Thread(target=self._icon.run, daemon=True)
         self._thread.start()
 
@@ -146,11 +180,17 @@ class TrayIcon:
         if self._icon is not None:
             self._icon.stop()
 
-    def update_battery(self, state: BatteryState) -> None:
+    def update_battery(
+        self, state: BatteryState, *, transport: Optional[str] = None
+    ) -> None:
         if self._icon is None:
             return
-        self._icon.icon = render_battery_image(state)
-        if state.is_stale or state.percent is None:
+        if transport in ("wired", "wireless"):
+            self._transport = transport
+        self._icon.icon = render_battery_image(state, transport=self._transport)
+        if self._transport == "wired" and (state.is_stale or state.percent is None):
+            tooltip = "QMK.Top Manager — USB: проводное подключение"
+        elif state.is_stale or state.percent is None:
             tooltip = "QMK.Top Manager — Battery: no data"
         else:
             suffix = " ⚡" if state.charging else ""

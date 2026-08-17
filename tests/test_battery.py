@@ -73,6 +73,27 @@ def test_read_once_parses_percent_at_offset():
     assert fake.closed is True
 
 
+def test_read_once_uses_default_query_when_device_has_no_saved_query():
+    fake = FakeHidDevice(response_bytes=[0, 0, 87, 0, 0, 0, 0, 0])
+    config = {
+        "query": [], "report_id": 0, "response_length": 8,
+        "response_offset": 2, "response_scale": 1,
+        "charging_offset": None, "charging_mask": 0,
+    }
+    monitor = BatteryMonitor(
+        config_battery=config,
+        usb_lock=threading.Lock(),
+        get_device_path=lambda: "\\\\fake\\path",
+        hid_device_factory=lambda: fake,
+        default_query=[0xF7, 0x00],
+    )
+
+    monitor.read_once()
+
+    assert monitor.state.percent == 87
+    assert fake.sent == [[0, 0xF7, 0x00]]
+
+
 def test_read_once_applies_response_scale():
     fake = FakeHidDevice(response_bytes=[0, 0, 50, 0, 0, 0, 0, 0])
     config = {
@@ -190,3 +211,41 @@ def test_read_once_does_not_retain_previous_value_on_failure():
     monitor.read_once()
     assert monitor.state.percent is None  # Last good value NOT retained.
     assert monitor.state.is_stale is True
+
+
+def test_zero_response_needs_a_second_poll_before_it_is_shown():
+    """A deaf HID endpoint often echoes zeroes; do not flash a fake 0%."""
+    fake = FakeHidDevice(response_bytes=[0, 0, 0, 0, 0, 0, 0, 0])
+    monitor = make_monitor(fake)
+
+    monitor.read_once()
+    assert monitor.state.percent is None
+    assert monitor.state.is_stale is True
+
+    monitor.read_once()
+    assert monitor.state.percent == 0
+    assert monitor.state.is_stale is False
+
+
+def test_nonzero_response_on_another_hid_path_beats_a_zero_echo():
+    zero = FakeHidDevice(response_bytes=[0, 0, 0, 0, 0, 0, 0, 0])
+    full = FakeHidDevice(response_bytes=[0, 0, 72, 0, 0, 0, 0, 0])
+    devices = iter([zero, full])
+    monitor = BatteryMonitor(
+        config_battery={
+            "query": [0xAB, 0xCD], "report_id": 0, "response_length": 8,
+            "response_offset": 2, "response_scale": 1,
+            "charging_offset": None, "charging_mask": 0,
+        },
+        usb_lock=threading.Lock(),
+        get_device_path=lambda: "\\\\fake\\fallback",
+        get_device_paths=lambda: ["\\\\fake\\zero", "\\\\fake\\battery"],
+        hid_device_factory=lambda: next(devices),
+    )
+
+    monitor.read_once()
+
+    assert monitor.state.percent == 72
+    assert monitor.state.is_stale is False
+    assert zero.closed is True
+    assert full.closed is True

@@ -1,4 +1,19 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 docs/
+
+# Per-user runtime state and generated release artifacts
+profiles_config.json
+qmk_top_manager.log
+# Legacy local UI marker; it is not application source or public state.
+clickLanguage
+build/
+dist/
+
+# Never commit a private Authenticode certificate or private key.
+*.pfx
+*.p12
+*.pvk
+*.key

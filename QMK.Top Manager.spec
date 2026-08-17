@@ -4,7 +4,7 @@ import importlib.util
 from PyInstaller.utils.hooks import collect_all
 
 datas = [
-    ('docs/Microsoft-Fluentui-Emoji-Flat-Keyboard-Flat.512.ico', 'docs'),
+    ('assets/qmk-top-manager-keyboard.ico', 'assets'),
     ('sniffer.js', '.'),
     ('vendor/flet-windows.zip', 'flet_desktop/app'),
 ]
@@ -46,7 +46,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='QMK.Top Manager',
+    name='QMK.Top Manager for SK75 TMR',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -60,5 +60,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version_info.txt',
-    icon=['docs\\Microsoft-Fluentui-Emoji-Flat-Keyboard-Flat.512.ico'],
+    icon=['assets\\qmk-top-manager-keyboard.ico'],
 )

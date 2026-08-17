@@ -1,0 +1,3 @@
+# Reproducible Windows release builder. Runtime dependencies are in
+# requirements.txt; keep the packager separate so end users do not install it.
+pyinstaller==6.15.0
